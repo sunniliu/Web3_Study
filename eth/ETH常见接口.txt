@@ -1,0 +1,171 @@
+ETH常见接口
+
+### 1.建立连接和基础结构
+```
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"fmt"
+	"log"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// 全局变量，方便示例使用
+var (
+	client     *ethclient.Client
+	privateKey *ecdsa.PrivateKey
+	publicKey  *ecdsa.PublicKey
+	fromAddress common.Address
+)
+
+func init() {
+    // 连接到本地 Ganache 节点
+	var err error
+	client, err = ethclient.Dial("http://localhost:8545")
+	if err != nil {
+		log.Fatal("Failed to connect to the Ethereum client:", err)
+	}
+
+    // 从 Ganache 输出的账户中选一个，替换成你的私钥
+    // 注意：在实际项目中，永远不要硬编码私钥！使用环境变量。
+	ganachePrivateKey := "a0feb...（替换成Ganache输出的一个私钥，例如0x开头的那个）"
+    
+    // 去除可能的 '0x' 前缀
+    if ganachePrivateKey[:2] == "0x" {
+        ganachePrivateKey = ganachePrivateKey[2:]
+    }
+    
+    // 解析私钥
+	privateKey, err = crypto.HexToECDSA(ganachePrivateKey)
+	if err != nil {
+		log.Fatal("Failed to parse private key:", err)
+	}
+
+    // 从私钥推导出公钥和地址
+	publicKey = privateKey.Public().(*ecdsa.PublicKey)
+	fromAddress = crypto.PubkeyToAddress(*publicKey)
+	fmt.Println("Connected! From address:", fromAddress.Hex())
+}
+```
+
+### 2.查询区块数据
+```
+func getBlockByNumber(blockNumber *big.Int) {
+	block, err := client.BlockByNumber(context.Background(), blockNumber)
+	if err != nil {
+		log.Fatal("Failed to get block:", err)
+	}
+
+	fmt.Printf("\n=== Block by Number: %d ===\n", blockNumber)
+	fmt.Println("Block Hash:", block.Hash().Hex())
+	fmt.Println("Block Number:", block.Number().Uint64())
+	fmt.Println("Block Time:", block.Time())
+	fmt.Println("Number of Transactions:", len(block.Transactions()))
+}
+
+func getBlockByHash(blockHash string) {
+	hash := common.HexToHash(blockHash)
+	block, err := client.BlockByHash(context.Background(), hash)
+	if err != nil {
+		log.Fatal("Failed to get block by hash:", err)
+	}
+
+	fmt.Printf("\n=== Block by Hash: %s ===\n", blockHash)
+	fmt.Println("Block Number:", block.Number().Uint64())
+}
+```
+
+### 3. 查询交易（使用交易hash） 
+```
+func getTransaction(txHash string) {
+	hash := common.HexToHash(txHash)
+	tx, isPending, err := client.TransactionByHash(context.Background(), hash)
+	if err != nil {
+		log.Fatal("Failed to get transaction:", err)
+	}
+
+	fmt.Printf("\n=== Transaction: %s ===\n", txHash)
+	fmt.Println("Hash:", tx.Hash().Hex())
+	fmt.Println("Value:", tx.Value().String(), "wei")
+	fmt.Println("To:", tx.To().Hex())
+	fmt.Println("Is Pending?", isPending)
+
+	// 4. 获取该交易的收据
+	receipt, err := client.TransactionReceipt(context.Background(), hash)
+	if err != nil {
+		log.Fatal("Failed to get receipt:", err)
+	}
+	fmt.Println("\n--- Transaction Receipt ---")
+	fmt.Println("Status (1=Success, 0=Fail):", receipt.Status)
+	fmt.Println("Gas Used:", receipt.GasUsed)
+	fmt.Println("Block Number:", receipt.BlockNumber.Uint64())
+    if len(receipt.Logs) > 0 {
+        fmt.Println("Logs:", len(receipt.Logs))
+    }
+}
+```
+
+### 发起交易(转账)
+```
+func sendTransaction(toAddressStr string, amount int64) {
+    // 1. 将字符串地址转换为 common.Address 类型
+	toAddress := common.HexToAddress(toAddressStr)
+
+    // 2. 获取Nonce（账户交易计数器）
+	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
+	if err != nil {
+		log.Fatal("Failed to get nonce:", err)
+	}
+
+    // 3. 获取当前建议的Gas价格
+	gasPrice, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		log.Fatal("Failed to get gas price:", err)
+	}
+
+    // 4. 估算Gas Limit（简单的转账固定为21000）
+	gasLimit := uint64(21000)
+
+    // 5. 构建交易对象
+    value := big.NewInt(amount) // 单位：wei (1 ether = 10^18 wei)
+    // 例如，发送 0.1 ETH：big.NewInt(100000000000000000)
+
+	tx := types.NewTx(&types.LegacyTx{
+		Nonce:    nonce,
+		To:       &toAddress,
+		Value:    value,
+		Gas:      gasLimit,
+		GasPrice: gasPrice,
+	})
+
+    // 6. 获取链ID（Ganache通常为1337）
+	chainID, err := client.ChainID(context.Background())
+	if err != nil {
+		log.Fatal("Failed to get chain ID:", err)
+	}
+
+    // 7. 使用私钥对交易进行签名
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
+	if err != nil {
+		log.Fatal("Failed to sign transaction:", err)
+	}
+
+    // 8. 发送交易
+	err = client.SendTransaction(context.Background(), signedTx)
+	if err != nil {
+		log.Fatal("Failed to send transaction:", err)
+	}
+
+	fmt.Printf("\n=== Transaction Sent ===\n")
+	fmt.Println("Tx Hash:", signedTx.Hash().Hex())
+    // 你可以将这个 hash 用于 getTransaction 查询
+}
+```
+
