@@ -1,0 +1,101 @@
+eth常见的命令
+
+1. console / attach
+启动一个交互式的 JavaScript 控制台。
+
+console：启动一个新的 Geth 节点并同时打开控制台。
+
+attach：连接到已经在运行的 Geth 节点的 IPC 端点。
+
+常用选项：
+
+--jspath：设置加载 JavaScript 文件的目录。
+
+--exec：执行一条 JavaScript 语句后退出（非交互模式）。
+
+--preload：在控制台启动前预加载一个或多个 JavaScript 文件。
+
+```
+# 启动节点并打开控制台，数据存放在 mydata 目录
+geth --datadir ./mydata console
+
+# 连接到本地默认数据目录下运行的节点
+geth attach
+
+# 连接到指定IPC文件
+geth attach /path/to/geth.ipc
+
+# 连接到HTTP RPC端点（如果启用了HTTP）
+geth attach http://127.0.0.1:8545
+
+# 执行一条命令后退出
+geth --exec "eth.blockNumber" attach
+```
+
+### 2.Account
+**子命令：**
+*   `list`：列出所有账户。
+*   `new`：创建新账户（会提示输入密码）。
+*   `update`：更新一个已存在的账户（如修改密码）。
+*   `import`：从私钥文件导入账户。
+
+**常用选项：**
+*   `--datadir` / `--keystore`：指定密钥库目录。
+*   `--password`：指定包含密码的文件路径，避免交互式输入。
+
+**示例：**
+```bash
+# 列出所有账户
+geth account list
+
+# 创建新账户
+geth account new --datadir ./mydata
+
+# 使用密码文件创建新账户
+geth account new --password ./password.txt
+
+# 导入私钥文件
+geth account import ./privatekey.json
+```
+
+3.Init
+
+**必需参数：**
+*   `<genesis.json 路径>`：指定创世块配置文件的路径。
+
+**常用选项：**
+*   `--datadir`：指定要初始化的数据目录。
+
+**示例：**
+```bash
+# 使用 genesis.json 文件初始化区块链
+geth --datadir ./mydata init ./genesis.json
+```
+
+### 3.import/export
+```
+*   `import`：从一个文件导入区块。
+*   `export`：将区块导出到一个文件。
+
+**常用选项：**
+*   `--datadir`：指定数据目录。
+*   `--block`：指定要导出的区块号或范围（如 `1 1000`）。
+
+**示例：**
+```bash
+# 导出区块 0 到 100000 到文件
+geth --datadir ./mydata export ./chaindata.txt 0 100000
+```
+
+### 4.dump
+转储区块链上的特定状态（如存储、代码）。
+
+**常用选项：**
+*   `--datadir`：数据目录。
+*   `--block`：指定要转储的区块高度（默认为最新块）。
+
+**示例：**
+```bash
+# 转储最新区块的状态
+geth --datadir ./mydata dump
+```
