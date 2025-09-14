@@ -99,3 +99,329 @@ geth --datadir ./mydata export ./chaindata.txt 0 100000
 # 转储最新区块的状态
 geth --datadir ./mydata dump
 ```
+
+
+### 1.连接以太坊
+```
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func main() {
+    // 使用Infura或本地节点作为HTTP提供商
+    client, err := ethclient.Dial("https://mainnet.infura.io/v3/YOUR_PROJECT_ID")
+    // 或者连接本地节点: client, err := ethclient.Dial("http://localhost:8545")
+    // 或者使用IPC文件（通常更快，但需要节点在本地）: client, err := ethclient.Dial("/home/user/.ethereum/geth.ipc")
+    
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // 获取当前区块号以测试连接
+    header, err := client.HeaderByNumber(context.Background(), nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("Latest block number:", header.Number.String())
+}
+```
+
+
+
+
+使用 abigen 工具将ABI转换为Go代码：
+
+bash
+abigen --abi=token.abi --pkg=main --type=Token --out=token.go
+
+
+### 3.查询ERC-20代币基本信息
+```
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+// 假设你已使用abigen生成了token.go文件，并包含了以下结构体（具体名称需根据abigen生成调整）
+// 以下代码假设生成的合约类型名为*Token
+
+func main() {
+    client, err := ethclient.Dial("https://mainnet.infura.io/v3/YOUR_PROJECT_ID")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // 替换为GTH代币的实际合约地址
+    tokenAddress := common.HexToAddress("0xYourGTHTokenContractAddress")
+    instance, err := NewToken(tokenAddress, client) // NewToken 应由 abigen 生成
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 1. 获取代币名称
+    name, err := instance.Name(nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Name: %s\n", name)
+
+    // 2. 获取代币符号
+    symbol, err := instance.Symbol(nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Symbol: %s\n", symbol)
+
+    // 3. 获取小数位数
+    decimals, err := instance.Decimals(nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Decimals: %v\n", decimals)
+
+    // 4. 获取总供应量
+    totalSupply, err := instance.TotalSupply(nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Total Supply: %s\n", totalSupply.String())
+}
+```
+
+### 4.查询代币余额
+```
+// ...（连接客户端和实例化合约的代码同上）
+
+    // 替换为要查询的地址
+    address := common.HexToAddress("0xWalletAddressToQuery")
+    balance, err := instance.BalanceOf(nil, address)
+    if err != nil {
+        log.Fatal(err)
+    }
+    // 通常需要根据代币的decimals来格式化余额
+    decimals, _ := instance.Decimals(nil)
+    adjustedBalance := new(big.Float).SetInt(balance)
+    // 计算10^decimals
+    divisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+    humanBalance := new(big.Float).Quo(adjustedBalance, divisor)
+    fmt.Printf("Balance: %f GTH\n", humanBalance)
+```
+
+### 5.转发代币
+```
+package main
+
+import (
+    "context"
+    "crypto/ecdsa"
+    "fmt"
+    "log"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum/accounts/abi/bind"
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/crypto"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func main() {
+    client, err := ethclient.Dial("https://mainnet.infura.io/v3/YOUR_PROJECT_ID")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // 1. 加载私钥（务必安全处理，不要硬编码在代码中）
+    privateKey, err := crypto.HexToECDSA("YourPrivateKeyHexWithout0xPrefix")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    publicKey := privateKey.Public()
+    publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+    if !ok {
+        log.Fatal("cannot assert type: publicKey is not of type *ecdsa.PublicKey")
+    }
+
+    fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+
+    // 2. 获取Nonce和Gas价格等交易参数
+    nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    gasPrice, err := client.SuggestGasPrice(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 3. 设置认证信息（TransactOpts）
+    auth, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(1)) // 1代表以太坊主网ChainID，测试网不同
+    if err != nil {
+        log.Fatal(err)
+    }
+    auth.Nonce = big.NewInt(int64(nonce))
+    auth.GasLimit = uint64(100000) // 根据合约交易的复杂程度设置足够的Gas Limit，通常查询预估Gas
+    auth.GasPrice = gasPrice
+    auth.Value = big.NewInt(0) // 发送代币时，Value设置为0，因为不是发送ETH
+
+    // 4. 实例化合约（同上）
+    tokenAddress := common.HexToAddress("0xYourGTHTokenContractAddress")
+    instance, err := NewToken(tokenAddress, client)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 5. 调用合约的Transfer方法
+    toAddress := common.HexToAddress("0xRecipientAddress")
+    // amount: 这里传输的是代币的最小单位（如wei），需要乘以10^decimals
+    decimals, err := instance.Decimals(nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    amount := new(big.Int)
+    amount.SetString("1000000000000000000", 10) // 这里示例是传输1个代币（假设decimals=18），实际根据数量计算
+    // 使用 big.NewInt 或 SetString 根据实际要传输的数量（考虑decimals）构造amount
+
+    tx, err := instance.Transfer(auth, toAddress, amount)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Transfer transaction sent: %s\n", tx.Hash().Hex())
+}
+```
+
+### 6.估算Gas消耗
+```
+// ...（拥有合约实例instance和认证信息auth后，但在实际执行交易如Transfer之前）
+
+    // 为估算Gas，我们通常使用`Call`方法模拟交易
+    callOpts := &bind.CallOpts{Pending: true}
+    transactOpts := &bind.TransactOpts{
+        From:   auth.From,
+        Signer: auth.Signer,
+        // 不提供GasLimit，让其估算
+        Value:    auth.Value,
+        GasPrice: auth.GasPrice,
+    }
+
+    // 对于估算Gas，go-ethereum的bind包在处理时会自动估算，但也可以手动查询
+    // 另一种方式是使用客户端的EstimateGas方法
+    msg := ethereum.CallMsg{
+        From: transactOpts.From,
+        To:   &tokenAddress, // 合约地址
+        Data: []byte{},      // 需要构建调用Transfer方法的Calldata，这里简化了
+        // 实际需要编码函数调用和参数
+    }
+    gasLimit, err := client.EstimateGas(context.Background(), msg)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Estimated Gas: %v\n", gasLimit)
+    auth.GasLimit = gasLimit // 然后设置到auth中
+
+// 然后再调用instance.Transfer
+```
+
+### 3.监听代币转账事件
+```
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func main() {
+    client, err := ethclient.Dial("wss://mainnet.infura.io/ws/v3/YOUR_PROJECT_ID") // 使用WebSocket连接以订阅事件
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // 代币合约地址
+    tokenAddress := common.HexToAddress("0xYourGTHTokenContractAddress")
+
+    // 监听Transfer事件
+    // 首先，你需要知道Transfer事件的签名哈希（通常是 topic[0]）
+    // Transfer事件签名: Transfer(address,address,uint256)
+    transferEventSignature := []byte("Transfer(address,address,uint256)")
+    // 在go-ethereum中，通常使用abi包来生成话题，但这里简化直接使用日志过滤
+    // 更常见的是使用合约实例的WatchTransfer等方法（如果由abigen生成且包含事件）
+
+    // 创建一个查询过滤器
+    query := ethereum.FilterQuery{
+        Addresses: []common.Address{tokenAddress},
+    }
+
+    logs := make(chan types.Log)
+    sub, err := client.SubscribeFilterLogs(context.Background(), query, logs)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("开始监听Transfer事件...")
+    for {
+        select {
+        case err := <-sub.Err():
+            log.Fatal(err)
+        case vLog := <-logs:
+            // 解析日志
+            // 你需要根据ABI来解析vLog.Data和vLog.Topics
+            // 如果使用abigen生成的合约代码，可能会有辅助方法如ParseTransfer
+            fmt.Printf("收到日志: Block Hash: %s, Tx Hash: %s\n", vLog.BlockHash.Hex(), vLog.TxHash.Hex())
+            // 具体解析Transfer事件参数（from, to, value）需要解析Topics和Data
+            // from = common.HexToAddress(vLog.Topics[1].Hex())
+            // to = common.HexToAddress(vLog.Topics[2].Hex())
+            // value = new(big.Int).SetBytes(vLog.Data)
+        }
+    }
+}
+```
+
+### 其他操作
+```
+// 获取特定地址的ETH余额
+ethBalance, err := client.BalanceAt(context.Background(), address, nil)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("ETH Balance: %s\n", ethBalance.String())
+
+// 获取交易信息
+txHash := common.HexToHash("0xTransactionHashHex")
+tx, isPending, err := client.TransactionByHash(context.Background(), txHash)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Transaction Pending: %v\n", isPending)
+
+// 获取交易回执（查看交易是否成功、GasUsed等）
+receipt, err := client.TransactionReceipt(context.Background(), txHash)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Transaction Status: %v (1=成功, 0=失败)\n", receipt.Status)
+fmt.Printf("Gas Used: %v\n", receipt.GasUsed)
+```

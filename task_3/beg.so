@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract BeggingContract {
+    // 合约所有者
+    address payable public owner;
+    
+    // 记录捐赠者地址和捐赠金额
+    mapping(address => uint256) public donations;
+    
+    // 记录总捐赠金额
+    uint256 public totalDonations;
+    
+    // 事件：记录捐赠信息
+    event DonationReceived(address indexed donor, uint256 amount);
+    
+    // 事件：记录资金提取
+    event FundsWithdrawn(address indexed owner, uint256 amount);
+    
+    // 修饰器：仅允许所有者访问
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    // 构造函数：设置合约所有者
+    constructor() {
+        owner = payable(msg.sender);
+    }
+    
+    // 捐赠函数：允许用户向合约发送以太币
+    function donate() external payable {
+        require(msg.value > 0, "Donation amount must be greater than 0");
+        
+        // 记录捐赠信息
+        donations[msg.sender] += msg.value;
+        totalDonations += msg.value;
+        
+        // 触发捐赠事件
+        emit DonationReceived(msg.sender, msg.value);
+    }
+    
+    // 提取函数：允许合约所有者提取所有资金
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds to withdraw");
+        
+        // 向所有者转账
+        owner.transfer(balance);
+        
+        // 触发提取事件
+        emit FundsWithdrawn(owner, balance);
+    }
+    
+    // 查询函数：获取指定地址的捐赠金额
+    function getDonation(address donor) external view returns (uint256) {
+        return donations[donor];
+    }
+    
+    // 获取合约当前余额
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+    
+    // 回退函数：允许直接向合约地址发送以太币
+    receive() external payable {
+        donations[msg.sender] += msg.value;
+        totalDonations += msg.value;
+        emit DonationReceived(msg.sender, msg.value);
+    }
+}
