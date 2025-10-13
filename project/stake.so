@@ -1,1 +1,450 @@
-stake.so
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title Stake 质押系统合约
+ * @dev 支持多种代币质押，基于权重分配奖励的质押系统
+ */
+contract Stake is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    // 角色定义
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    // 奖励代币
+    IERC20 public rewardToken;
+    
+    // 每块奖励数量
+    uint256 public rewardPerBlock;
+
+    // 质押池信息
+    struct PoolInfo {
+        IERC20 stTokenAddress;      // 质押代币地址
+        uint256 poolWeight;         // 池权重
+        uint256 lastRewardBlock;    // 最后一次奖励计算区块
+        uint256 accRewardPerShare;  // 每份额累积奖励
+        uint256 stTokenAmount;      // 总质押量
+        uint256 minDepositAmount;   // 最小质押金额
+        uint256 unstakeLockedBlocks;// 解质押锁定区块数
+        bool isNativeToken;         // 是否是原生代币
+    }
+
+    // 用户信息
+    struct UserInfo {
+        uint256 stAmount;           // 质押数量
+        uint256 rewardDebt;         // 已分配奖励
+        uint256 pendingReward;      // 待领取奖励
+    }
+
+    // 解质押请求
+    struct UnstakeRequest {
+        uint256 amount;             // 解质押数量
+        uint256 unlockBlock;        // 解锁区块
+        bool claimed;               // 是否已领取
+    }
+
+    // 池信息数组
+    PoolInfo[] public poolInfo;
+    
+    // 用户信息映射 (pid => user address => UserInfo)
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    
+    // 解质押请求映射 (pid => user address => requests array)
+    mapping(uint256 => mapping(address => UnstakeRequest[])) public unstakeRequests;
+
+    // 事件定义
+    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
+    event UnstakeRequested(address indexed user, uint256 indexed pid, uint256 amount, uint256 unlockBlock);
+    event UnstakeClaimed(address indexed user, uint256 indexed pid, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 indexed pid, uint256 amount);
+    event PoolAdded(uint256 indexed pid, address stTokenAddress, uint256 poolWeight);
+    event PoolUpdated(uint256 indexed pid, uint256 poolWeight, uint256 minDepositAmount, uint256 unstakeLockedBlocks);
+    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+
+    // 修饰器：池存在检查
+    modifier validatePool(uint256 _pid) {
+        require(_pid < poolInfo.length, "Pool does not exist");
+        _;
+    }
+
+    /**
+     * @dev 构造函数
+     * @param _rewardToken 奖励代币地址
+     * @param _rewardPerBlock 每块奖励数量
+     * @param _admin 管理员地址
+     */
+    constructor(
+        address _rewardToken,
+        uint256 _rewardPerBlock,
+        address _admin
+    ) {
+        rewardToken = IERC20(_rewardToken);
+        rewardPerBlock = _rewardPerBlock;
+
+        _setupRole(DEFAULT_ADMIN_ROLE, _admin);
+        _setupRole(ADMIN_ROLE, _admin);
+        _setupRole(UPGRADER_ROLE, _admin);
+    }
+
+    /**
+     * @dev 获取池数量
+     */
+    function poolLength() external view returns (uint256) {
+        return poolInfo.length;
+    }
+
+    /**
+     * @dev 添加质押池
+     * @param _stTokenAddress 质押代币地址
+     * @param _poolWeight 池权重
+     * @param _minDepositAmount 最小质押金额
+     * @param _unstakeLockedBlocks 解质押锁定区块数
+     * @param _isNativeToken 是否是原生代币
+     */
+    function addPool(
+        address _stTokenAddress,
+        uint256 _poolWeight,
+        uint256 _minDepositAmount,
+        uint256 _unstakeLockedBlocks,
+        bool _isNativeToken
+    ) external onlyRole(ADMIN_ROLE) {
+        require(_stTokenAddress != address(0) || _isNativeToken, "Invalid token address");
+        require(_poolWeight > 0, "Pool weight must be greater than 0");
+
+        poolInfo.push(PoolInfo({
+            stTokenAddress: IERC20(_stTokenAddress),
+            poolWeight: _poolWeight,
+            lastRewardBlock: block.number,
+            accRewardPerShare: 0,
+            stTokenAmount: 0,
+            minDepositAmount: _minDepositAmount,
+            unstakeLockedBlocks: _unstakeLockedBlocks,
+            isNativeToken: _isNativeToken
+        }));
+
+        emit PoolAdded(poolInfo.length - 1, _stTokenAddress, _poolWeight);
+    }
+
+    /**
+     * @dev 更新质押池配置
+     * @param _pid 池ID
+     * @param _poolWeight 新权重
+     * @param _minDepositAmount 新最小质押金额
+     * @param _unstakeLockedBlocks 新解质押锁定区块数
+     */
+    function updatePool(
+        uint256 _pid,
+        uint256 _poolWeight,
+        uint256 _minDepositAmount,
+        uint256 _unstakeLockedBlocks
+    ) external onlyRole(ADMIN_ROLE) validatePool(_pid) {
+        require(_poolWeight > 0, "Pool weight must be greater than 0");
+
+        updatePoolReward(_pid);
+
+        PoolInfo storage pool = poolInfo[_pid];
+        pool.poolWeight = _poolWeight;
+        pool.minDepositAmount = _minDepositAmount;
+        pool.unstakeLockedBlocks = _unstakeLockedBlocks;
+
+        emit PoolUpdated(_pid, _poolWeight, _minDepositAmount, _unstakeLockedBlocks);
+    }
+
+    /**
+     * @dev 更新池奖励累积
+     * @param _pid 池ID
+     */
+    function updatePoolReward(uint256 _pid) public validatePool(_pid) {
+        PoolInfo storage pool = poolInfo[_pid];
+        if (block.number <= pool.lastRewardBlock) {
+            return;
+        }
+
+        if (pool.stTokenAmount == 0) {
+            pool.lastRewardBlock = block.number;
+            return;
+        }
+
+        uint256 multiplier = block.number - pool.lastRewardBlock;
+        uint256 totalWeight = getTotalWeight();
+        
+        if (totalWeight > 0) {
+            uint256 reward = multiplier * rewardPerBlock * pool.poolWeight / totalWeight;
+            pool.accRewardPerShare += reward * 1e12 / pool.stTokenAmount;
+        }
+
+        pool.lastRewardBlock = block.number;
+    }
+
+    /**
+     * @dev 获取总权重
+     */
+    function getTotalWeight() public view returns (uint256) {
+        uint256 totalWeight = 0;
+        for (uint256 i = 0; i < poolInfo.length; i++) {
+            totalWeight += poolInfo[i].poolWeight;
+        }
+        return totalWeight;
+    }
+
+    /**
+     * @dev 质押代币
+     * @param _pid 池ID
+     * @param _amount 质押数量
+     */
+    function deposit(uint256 _pid, uint256 _amount) 
+        external 
+        payable 
+        nonReentrant 
+        whenNotPaused 
+        validatePool(_pid) 
+    {
+        require(_amount > 0, "Amount must be greater than 0");
+
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        require(_amount >= pool.minDepositAmount, "Amount below minimum deposit");
+
+        updatePoolReward(_pid);
+
+        // 处理待领取奖励
+        if (user.stAmount > 0) {
+            uint256 pending = user.stAmount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+            if (pending > 0) {
+                user.pendingReward += pending;
+            }
+        }
+
+        // 处理代币转入
+        if (pool.isNativeToken) {
+            require(msg.value == _amount, "ETH amount mismatch");
+            // 原生代币已经通过msg.value转入
+        } else {
+            require(msg.value == 0, "Cannot send ETH for non-native pool");
+            pool.stTokenAddress.safeTransferFrom(msg.sender, address(this), _amount);
+        }
+
+        // 更新用户和池信息
+        user.stAmount += _amount;
+        user.rewardDebt = user.stAmount * pool.accRewardPerShare / 1e12;
+        pool.stTokenAmount += _amount;
+
+        emit Deposit(msg.sender, _pid, _amount);
+    }
+
+    /**
+     * @dev 请求解质押
+     * @param _pid 池ID
+     * @param _amount 解质押数量
+     */
+    function requestUnstake(uint256 _pid, uint256 _amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+        validatePool(_pid) 
+    {
+        require(_amount > 0, "Amount must be greater than 0");
+
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        require(user.stAmount >= _amount, "Insufficient staked amount");
+
+        updatePoolReward(_pid);
+
+        // 计算待领取奖励
+        uint256 pending = user.stAmount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+        if (pending > 0) {
+            user.pendingReward += pending;
+        }
+
+        // 更新用户和池信息
+        user.stAmount -= _amount;
+        user.rewardDebt = user.stAmount * pool.accRewardPerShare / 1e12;
+        pool.stTokenAmount -= _amount;
+
+        // 创建解质押请求
+        uint256 unlockBlock = block.number + pool.unstakeLockedBlocks;
+        unstakeRequests[_pid][msg.sender].push(UnstakeRequest({
+            amount: _amount,
+            unlockBlock: unlockBlock,
+            claimed: false
+        }));
+
+        emit UnstakeRequested(msg.sender, _pid, _amount, unlockBlock);
+    }
+
+    /**
+     * @dev 领取解质押的代币
+     * @param _pid 池ID
+     * @param _requestIndex 请求索引
+     */
+    function claimUnstake(uint256 _pid, uint256 _requestIndex) 
+        external 
+        nonReentrant 
+        validatePool(_pid) 
+    {
+        UnstakeRequest storage request = unstakeRequests[_pid][msg.sender][_requestIndex];
+        
+        require(!request.claimed, "Already claimed");
+        require(block.number >= request.unlockBlock, "Still locked");
+
+        request.claimed = true;
+
+        PoolInfo storage pool = poolInfo[_pid];
+        uint256 amount = request.amount;
+
+        if (pool.isNativeToken) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            pool.stTokenAddress.safeTransfer(msg.sender, amount);
+        }
+
+        emit UnstakeClaimed(msg.sender, _pid, amount);
+    }
+
+    /**
+     * @dev 领取奖励
+     * @param _pid 池ID
+     */
+    function claimReward(uint256 _pid) 
+        external 
+        nonReentrant 
+        validatePool(_pid) 
+    {
+        updatePoolReward(_pid);
+
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        
+        // 计算新奖励
+        uint256 pending = user.stAmount * poolInfo[_pid].accRewardPerShare / 1e12 - user.rewardDebt;
+        if (pending > 0) {
+            user.pendingReward += pending;
+        }
+
+        user.rewardDebt = user.stAmount * poolInfo[_pid].accRewardPerShare / 1e12;
+
+        uint256 claimableReward = user.pendingReward;
+        require(claimableReward > 0, "No reward to claim");
+
+        user.pendingReward = 0;
+        rewardToken.safeTransfer(msg.sender, claimableReward);
+
+        emit RewardClaimed(msg.sender, _pid, claimableReward);
+    }
+
+    /**
+     * @dev 紧急提取（不领取奖励）
+     * @param _pid 池ID
+     */
+    function emergencyWithdraw(uint256 _pid) external nonReentrant validatePool(_pid) {
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        PoolInfo storage pool = poolInfo[_pid];
+
+        uint256 amount = user.stAmount;
+        require(amount > 0, "No staked amount");
+
+        // 重置用户信息
+        user.stAmount = 0;
+        user.rewardDebt = 0;
+        user.pendingReward = 0;
+        pool.stTokenAmount -= amount;
+
+        // 转账代币
+        if (pool.isNativeToken) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            pool.stTokenAddress.safeTransfer(msg.sender, amount);
+        }
+
+        emit EmergencyWithdraw(msg.sender, _pid, amount);
+    }
+
+    /**
+     * @dev 获取待领取奖励
+     * @param _pid 池ID
+     * @param _user 用户地址
+     */
+    function pendingReward(uint256 _pid, address _user) external view validatePool(_pid) returns (uint256) {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][_user];
+
+        uint256 accRewardPerShare = pool.accRewardPerShare;
+        if (block.number > pool.lastRewardBlock && pool.stTokenAmount != 0) {
+            uint256 multiplier = block.number - pool.lastRewardBlock;
+            uint256 totalWeight = getTotalWeight();
+            if (totalWeight > 0) {
+                uint256 reward = multiplier * rewardPerBlock * pool.poolWeight / totalWeight;
+                accRewardPerShare += reward * 1e12 / pool.stTokenAmount;
+            }
+        }
+
+        return user.pendingReward + (user.stAmount * accRewardPerShare / 1e12 - user.rewardDebt);
+    }
+
+    /**
+     * @dev 获取用户解质押请求数量
+     * @param _pid 池ID
+     * @param _user 用户地址
+     */
+    function getUnstakeRequestCount(uint256 _pid, address _user) external view returns (uint256) {
+        return unstakeRequests[_pid][_user].length;
+    }
+
+    /**
+     * @dev 获取用户解质押请求
+     * @param _pid 池ID
+     * @param _user 用户地址
+     * @param _index 请求索引
+     */
+    function getUnstakeRequest(uint256 _pid, address _user, uint256 _index) 
+        external 
+        view 
+        returns (UnstakeRequest memory) 
+    {
+        return unstakeRequests[_pid][_user][_index];
+    }
+
+    /**
+     * @dev 设置每块奖励数量
+     * @param _rewardPerBlock 新的每块奖励数量
+     */
+    function setRewardPerBlock(uint256 _rewardPerBlock) external onlyRole(ADMIN_ROLE) {
+        // 更新所有池的奖励
+        for (uint256 pid = 0; pid < poolInfo.length; pid++) {
+            updatePoolReward(pid);
+        }
+        rewardPerBlock = _rewardPerBlock;
+    }
+
+    /**
+     * @dev 提取意外发送的代币
+     * @param _token 代币地址
+     * @param _to 接收地址
+     * @param _amount 提取数量
+     */
+    function rescueTokens(address _token, address _to, uint256 _amount) external onlyRole(ADMIN_ROLE) {
+        require(_to != address(0), "Invalid address");
+        
+        if (_token == address(0)) {
+            // 提取原生代币
+            (bool success, ) = _to.call{value: _amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            IERC20(_token).safeTransfer(_to, _amount);
+        }
+    }
+
+    // 接收原生代币
+    receive() external payable {}
+}
