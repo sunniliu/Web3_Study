@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract MemeToken is ERC20, Ownable {
+    using SafeMath for uint256;
+    
+    // 代币税相关变量
+    uint256 public buyTax = 5;    // 买入税5%
+    uint256 public sellTax = 10;  // 卖出税10%
+    uint256 public transferTax = 2; // 转账税2%
+    
+    address public marketingWallet;
+    address public liquidityWallet;
+    address public developmentWallet;
+    
+    // 交易限制相关变量
+    uint256 public maxTxAmount;      // 最大交易量
+    uint256 public maxHoldAmount;    // 最大持仓量
+    uint256 public tradingCooldown;  // 交易冷却时间
+    uint256 public antiWhaleThreshold; // 巨鲸检测阈值
+    
+    mapping(address => uint256) private lastTradeTime;
+    mapping(address => bool) private excludedFromTax;
+    mapping(address => bool) private excludedFromLimit;
+    
+    // 流动性池地址
+    address public liquidityPool;
+    bool public tradingEnabled;
+    
+    // 事件定义
+    event TaxDistributed(uint256 marketingAmount, uint256 liquidityAmount, uint256 developmentAmount);
+    event TradingEnabled();
+    event LiquidityPoolSet(address pool);
+    
+    constructor(
+        string memory name,
+        string memory symbol,
+        uint256 totalSupply,
+        address _marketingWallet,
+        address _liquidityWallet,
+        address _developmentWallet
+    ) ERC20(name, symbol) {
+        _mint(msg.sender, totalSupply * 10**decimals());
+        
+        marketingWallet = _marketingWallet;
+        liquidityWallet = _liquidityWallet;
+        developmentWallet = _developmentWallet;
+        
+        // 初始化交易限制
+        maxTxAmount = totalSupply.mul(2).div(100); // 总供应量2%
+        maxHoldAmount = totalSupply.mul(5).div(100); // 总供应量5%
+        tradingCooldown = 30 seconds;
+        antiWhaleThreshold = totalSupply.mul(1).div(100); // 1%
+        
+        // 部署者和管理地址免除限制和税收
+        excludedFromTax[msg.sender] = true;
+        excludedFromTax[address(this)] = true;
+        excludedFromLimit[msg.sender] = true;
+        excludedFromLimit[address(this)] = true;
+        
+        tradingEnabled = false;
+    }
+    
+    // 代币税核心功能
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual override {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+        
+        // 检查交易是否开启
+        if (!tradingEnabled) {
+            require(excludedFromTax[sender] || excludedFromTax[recipient], "Trading not enabled");
+        }
+        
+        // 检查交易限制
+        if (!excludedFromLimit[sender] && !excludedFromLimit[recipient]) {
+            _validateTransfer(sender, recipient, amount);
+        }
+        
+        uint256 taxAmount = 0;
+        
+        // 计算税费（如果发送方或接收方不在免税列表中）
+        if (!excludedFromTax[sender] && !excludedFromTax[recipient]) {
+            taxAmount = _calculateTax(sender, recipient, amount);
+        }
+        
+        // 执行转账
+        if (taxAmount > 0) {
+            uint256 netAmount = amount.sub(taxAmount);
+            super._transfer(sender, address(this), taxAmount);
+            super._transfer(sender, recipient, netAmount);
+            
+            // 分配税费
+            _distributeTax(taxAmount);
+        } else {
+            super._transfer(sender, recipient, amount);
+        }
+        
+        // 更新最后交易时间
+        if (!excludedFromLimit[sender]) {
+            lastTradeTime[sender] = block.timestamp;
+        }
+        if (!excludedFromLimit[recipient]) {
+            lastTradeTime[recipient] = block.timestamp;
+        }
+    }
+    
+    // 计算税费
+    function _calculateTax(address sender, address recipient, uint256 amount) 
+        internal view returns (uint256) {
+        // 如果是买入（从流动性池购买）
+        if (recipient == liquidityPool) {
+            return amount.mul(sellTax).div(100);
+        }
+        // 如果是卖出（向流动性池出售）
+        else if (sender == liquidityPool) {
+            return amount.mul(buyTax).div(100);
+        }
+        // 普通转账
+        else {
+            return amount.mul(transferTax).div(100);
+        }
+    }
+    
+    // 分配税费
+    function _distributeTax(uint256 taxAmount) internal {
+        uint256 marketingShare = taxAmount.mul(40).div(100); // 40% 营销
+        uint256 liquidityShare = taxAmount.mul(30).div(100); // 30% 流动性
+        uint256 developmentShare = taxAmount.mul(30).div(100); // 30% 开发
+        
+        super._transfer(address(this), marketingWallet, marketingShare);
+        super._transfer(address(this), liquidityWallet, liquidityShare);
+        super._transfer(address(this), developmentWallet, developmentShare);
+        
+        emit TaxDistributed(marketingShare, liquidityShare, developmentShare);
+    }
+    
+    // 交易验证
+    function _validateTransfer(address sender, address recipient, uint256 amount) internal view {
+        // 检查单笔交易限额
+        require(amount <= maxTxAmount, "Transfer amount exceeds max transaction limit");
+        
+        // 检查持仓限额（仅对接收方检查）
+        if (recipient != liquidityPool) {
+            require(
+                balanceOf(recipient).add(amount) <= maxHoldAmount,
+                "Receiver would exceed max hold amount"
+            );
+        }
+        
+        // 检查交易冷却时间
+        require(
+            block.timestamp >= lastTradeTime[sender].add(tradingCooldown),
+            "Must wait for cooldown period"
+        );
+        
+        // 巨鲸检测
+        if (amount >= antiWhaleThreshold) {
+            require(
+                balanceOf(sender).sub(amount) >= antiWhaleThreshold,
+                "Large transfers must maintain minimum balance"
+            );
+        }
+    }
+    
+    // 流动性池管理功能
+    function setLiquidityPool(address pool) external onlyOwner {
+        require(pool != address(0), "Invalid pool address");
+        liquidityPool = pool;
+        excludedFromTax[pool] = true;
+        excludedFromLimit[pool] = true;
+        
+        emit LiquidityPoolSet(pool);
+    }
+    
+    // 添加流动性
+    function addLiquidity(uint256 tokenAmount, uint256 ethAmount) external onlyOwner {
+        require(liquidityPool != address(0), "Liquidity pool not set");
+        require(balanceOf(msg.sender) >= tokenAmount, "Insufficient token balance");
+        
+        // 转账代币到流动性池
+        super._transfer(msg.sender, liquidityPool, tokenAmount);
+        
+        // 在实际应用中，这里会调用路由器的添加流动性函数
+        // 简化示例中只进行基础转账
+    }
+    
+    // 移除流动性
+    function removeLiquidity(uint256 liquidityAmount) external onlyOwner {
+        require(liquidityPool != address(0), "Liquidity pool not set");
+        
+        // 在实际应用中，这里会调用路由器的移除流动性函数
+        // 简化示例
+    }
+    
+    // 交易控制功能
+    function enableTrading() external onlyOwner {
+        require(!tradingEnabled, "Trading already enabled");
+        require(liquidityPool != address(0), "Liquidity pool must be set first");
+        
+        tradingEnabled = true;
+        emit TradingEnabled();
+    }
+    
+    // 税率设置功能
+    function setTaxRates(uint256 _buyTax, uint256 _sellTax, uint256 _transferTax) external onlyOwner {
+        require(_buyTax <= 15, "Buy tax too high");
+        require(_sellTax <= 20, "Sell tax too high");
+        require(_transferTax <= 5, "Transfer tax too high");
+        
+        buyTax = _buyTax;
+        sellTax = _sellTax;
+        transferTax = _transferTax;
+    }
+    
+    // 交易限制设置
+    function setTradingLimits(
+        uint256 _maxTxAmount,
+        uint256 _maxHoldAmount,
+        uint256 _cooldown
+    ) external onlyOwner {
+        maxTxAmount = _maxTxAmount;
+        maxHoldAmount = _maxHoldAmount;
+        tradingCooldown = _cooldown;
+    }
+    
+    // 管理免税和免限制列表
+    function setExcludedFromTax(address account, bool excluded) external onlyOwner {
+        excludedFromTax[account] = excluded;
+    }
+    
+    function setExcludedFromLimit(address account, bool excluded) external onlyOwner {
+        excludedFromLimit[account] = excluded;
+    }
+    
+    // 紧急停止交易
+    function emergencyPause() external onlyOwner {
+        tradingEnabled = false;
+    }
+    
+    // 查询功能
+    function isExcludedFromTax(address account) external view returns (bool) {
+        return excludedFromTax[account];
+    }
+    
+    function isExcludedFromLimit(address account) external view returns (bool) {
+        return excludedFromLimit[account];
+    }
+    
+    function getLastTradeTime(address account) external view returns (uint256) {
+        return lastTradeTime[account];
+    }
+}
