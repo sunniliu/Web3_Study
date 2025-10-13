@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "forge-std/Test.sol";
+import "../contracts/Stake.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+// 测试用的ERC20代币
+contract MockERC20 is ERC20 {
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) {
+        _mint(msg.sender, 1000000 * 10**18);
+    }
+
+    function mint(address to, uint256 amount) public {
+        _mint(to, amount);
+    }
+}
+
+contract StakeTest is Test {
+    Stake public stake;
+    MockERC20 public rewardToken;
+    MockERC20 public stToken1;
+    MockERC20 public stToken2;
+    
+    address admin = address(0x1);
+    address user1 = address(0x2);
+    address user2 = address(0x3);
+    
+    uint256 rewardPerBlock = 1e18; // 1 token per block
+
+    function setUp() public {
+        vm.startPrank(admin);
+        
+        // 部署代币
+        rewardToken = new MockERC20("Reward Token", "RWD");
+        stToken1 = new MockERC20("Stake Token 1", "ST1");
+        stToken2 = new MockERC20("Stake Token 2", "ST2");
+        
+        // 部署质押合约
+        stake = new Stake(
+            address(rewardToken),
+            rewardPerBlock,
+            admin
+        );
+        
+        // 给质押合约转一些奖励代币
+        rewardToken.mint(address(stake), 100000 * 10**18);
+        
+        // 给用户分配代币
+        stToken1.mint(user1, 10000 * 10**18);
+        stToken1.mint(user2, 10000 * 10**18);
+        stToken2.mint(user1, 10000 * 10**18);
+        stToken2.mint(user2, 10000 * 10**18);
+        
+        // 添加质押池
+        stake.addPool(address(stToken1), 50, 100, 10, false); // pid 0
+        stake.addPool(address(stToken2), 30, 50, 5, false);  // pid 1
+        
+        vm.stopPrank();
+    }
+
+    function testAddPool() public {
+        vm.startPrank(admin);
+        
+        uint256 initialPoolCount = stake.poolLength();
+        
+        stake.addPool(address(stToken1), 20, 200, 15, false);
+        
+        assertEq(stake.poolLength(), initialPoolCount + 1);
+        
+        (IERC20 stToken, uint256 weight, , , uint256 minDeposit, uint256 lockedBlocks, bool isNative) = stake.poolInfo(initialPoolCount);
+        
+        assertEq(address(stToken), address(stToken1));
+        assertEq(weight, 20);
+        assertEq(minDeposit, 200);
+        assertEq(lockedBlocks, 15);
+        assertEq(isNative, false);
+    }
+
+    function testDeposit() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 1000 * 10**18;
+        stToken1.approve(address(stake), depositAmount);
+        
+        stake.deposit(0, depositAmount);
+        
+        (uint256 userStAmount, , ) = stake.userInfo(0, user1);
+        assertEq(userStAmount, depositAmount);
+    }
+
+    function testDepositBelowMinimum() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 50 * 10**18; // 低于最小质押金额100
+        stToken1.approve(address(stake), depositAmount);
+        
+        vm.expectRevert("Amount below minimum deposit");
+        stake.deposit(0, depositAmount);
+    }
+
+    function testRequestUnstake() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 1000 * 10**18;
+        stToken1.approve(address(stake), depositAmount);
+        stake.deposit(0, depositAmount);
+        
+        uint256 unstakeAmount = 500 * 10**18;
+        stake.requestUnstake(0, unstakeAmount);
+        
+        (uint256 userStAmountAfter, , ) = stake.userInfo(0, user1);
+        assertEq(userStAmountAfter, depositAmount - unstakeAmount);
+        
+        uint256 requestCount = stake.getUnstakeRequestCount(0, user1);
+        assertEq(requestCount, 1);
+    }
+
+    function testClaimReward() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 1000 * 10**18;
+        stToken1.approve(address(stake), depositAmount);
+        stake.deposit(0, depositAmount);
+        
+        // 跳过一些区块以累积奖励
+        vm.roll(block.number + 100);
+        
+        uint256 pendingBefore = stake.pendingReward(0, user1);
+        assertTrue(pendingBefore > 0);
+        
+        // 给合约转一些奖励代币用于支付
+        vm.stopPrank();
+        vm.startPrank(admin);
+        rewardToken.transfer(address(stake), pendingBefore);
+        vm.stopPrank();
+        
+        vm.startPrank(user1);
+        stake.claimReward(0);
+        
+        uint256 pendingAfter = stake.pendingReward(0, user1);
+        assertEq(pendingAfter, 0);
+        assertEq(rewardToken.balanceOf(user1), pendingBefore);
+    }
+
+    function testEmergencyWithdraw() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 1000 * 10**18;
+        stToken1.approve(address(stake), depositAmount);
+        stake.deposit(0, depositAmount);
+        
+        uint256 balanceBefore = stToken1.balanceOf(user1);
+        stake.emergencyWithdraw(0);
+        uint256 balanceAfter = stToken1.balanceOf(user1);
+        
+        assertEq(balanceAfter - balanceBefore, depositAmount);
+        
+        (uint256 userStAmount, , ) = stake.userInfo(0, user1);
+        assertEq(userStAmount, 0);
+    }
+
+    function testOnlyAdminCanAddPool() public {
+        vm.startPrank(user1);
+        
+        vm.expectRevert();
+        stake.addPool(address(stToken1), 20, 100, 10, false);
+    }
+
+    function testUpdatePool() public {
+        vm.startPrank(admin);
+        
+        stake.updatePool(0, 60, 150, 20);
+        
+        (, uint256 weight, , , uint256 minDeposit, uint256 lockedBlocks, ) = stake.poolInfo(0);
+        
+        assertEq(weight, 60);
+        assertEq(minDeposit, 150);
+        assertEq(lockedBlocks, 20);
+    }
+}
